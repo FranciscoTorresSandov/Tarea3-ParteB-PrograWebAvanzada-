@@ -19,3 +19,26 @@ En nuestro modelo, `UserSkills` necesita una entidad intermedia explícita: Ana 
 
 `Memberships` también es una entidad explícita: guarda rol, estado, fechas y solicitud de origen, y permite conservar varios periodos históricos de una misma pareja usuario–iniciativa.
 
+## 3. Paginación en la base de datos
+
+`Skip(n)` omite los primeros n resultados ordenados y `Take(k)` limita la cantidad recuperada a k. Deben aplicarse después de los filtros y un orden determinista, pero antes de materializar (`ToListAsync`). En SQL Server, el proveedor traduce la paginación por desplazamiento a `OFFSET … ROWS FETCH NEXT … ROWS ONLY` junto a `ORDER BY`. [5, 6]
+
+Para la página 1 del catálogo de iniciativas de tamaño 2, `Skip((1-1)*2)` equivale a `OFFSET 0 ROWS`, y `Take(2)` a `FETCH NEXT 2 ROWS ONLY`. El orden es fecha de creación descendente y UUID como desempate. Se calcula el total con los mismos filtros antes de paginar; los datos de prueba producen una iniciativa visible y una página. El SQL ilustrativo equivalente es:
+
+```sql
+SELECT Id, PublicId, Title FROM dbo.Initiatives
+WHERE Visibility = 'public' AND State IN ('published','forming_team','converted')
+ORDER BY CreatedAt DESC, CONVERT(char(36), PublicId) DESC
+OFFSET 0 ROWS FETCH NEXT 2 ROWS ONLY;
+```
+
+Paginar después de traer todos los registros aumenta memoria, tráfico y procesamiento del servidor. Aunque el desplazamiento puede encarecerse en páginas muy lejanas o sufrir cambios concurrentes, se mantiene aquí porque el contrato del Avance 2 usa páginas numeradas. [5]
+
+### Referencias oficiales — Microsoft Learn
+
+1. [Efficient Querying — proyección](https://learn.microsoft.com/en-us/ef/core/performance/efficient-querying).
+2. [Eager Loading of Related Data — Include](https://learn.microsoft.com/en-us/ef/core/querying/related-data/eager).
+3. [Tracking vs. No-Tracking Queries](https://learn.microsoft.com/en-us/ef/core/querying/tracking).
+4. [Many-to-many relationships — join entity with payload](https://learn.microsoft.com/en-us/ef/core/modeling/relationships/many-to-many).
+5. [Pagination — EF Core](https://learn.microsoft.com/en-us/ef/core/querying/pagination).
+6. [ORDER BY — OFFSET y FETCH en SQL Server](https://learn.microsoft.com/en-us/sql/t-sql/queries/select-order-by-clause-transact-sql).
