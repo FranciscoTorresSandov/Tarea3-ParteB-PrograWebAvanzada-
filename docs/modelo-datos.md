@@ -346,3 +346,258 @@ Historial de solo inserción en operaciones normales. UserId e InitiativeId se c
 
 Al menos una tecnología por proyecto, como máximo 20.
 
+### Integridad y reglas del dominio
+
+Las restricciones de una fila se expresan con CHECK, NOT NULL, UNIQUE y FK; las longitudes mínimas se pueden comprobar con CHECK(LEN(LTRIM(RTRIM(...))) >= mínimo). Los máximos de arreglos se imponen por posición única y rango; el mínimo de elementos, autenticación, pertenencia a perfil, roles, visibilidad y transiciones entre tablas se validan mediante servicios y transacciones EF Core. `CI_AI` significa insensible a mayúsculas y acentos, `CI_AS` insensible a mayúsculas y sensible a acentos. No se confía en la interfaz como control de acceso.
+
+- Al publicar: crear iniciativa, membresía activa del dueño y evento joined en una transacción. No existe guardado de borrador en la interfaz del Avance 2.
+- Aceptar: solo dueño, solicitud pendiente, solicitante sin membresía activa, iniciativa en published/forming_team/converted. Actualizar solicitud, crear membresía y evento joined; published pasa a forming_team, converted se mantiene. Oferta de competencia validada al solicitar/editar, no se obliga a conservarla indefinidamente en el perfil.
+- Retirar: solo dueño, nunca al propietario; cambiar estado/fecha y registrar evento retired. El integrante puede solicitar de nuevo. El historial de solicitudes y períodos no se borra.
+- Convertir: solo dueño, estado published/forming_team, mínimo dos miembros activos incluyendo propietario; crear proyecto en planning y marcar iniciativa converted atómicamente; el equipo no se copia.
+- Archivar y eliminar son distintos. Para borrar una iniciativa solo se admite el agregado sin solicitudes, proyecto ni historia adicional a la membresía/evento inicial del dueño. En esa transacción se eliminan primero ese evento y membresía inicial, después iniciativa (sus competencias y etiquetas se eliminan en cascada). Si hay historial, responder 409 y ofrecer archivo. Todas las demás relaciones históricas impiden borrado.
+- Un usuario anónimo solo ve iniciativas públicas de catálogo; institucional requiere identidad, restringida muestra resumen a terceros autenticados, privada se oculta a ajenos; dueño y miembro activo tienen detalle según estado. Borrador/archivada no aparecen en catálogo general y su detalle queda reservado al dueño. Los proyectos heredan acceso de la iniciativa de origen.
+- `memberCount`, `availableSpaces = MAX(0, EstimatedMembers - memberCount)` y `access` son derivados; no se guardan. El dueño cuenta como integrante. La estimación no impide aceptar solicitudes. `Revision` se incrementa junto a las mutaciones relevantes para prevenir carreras, con transacción y control optimista.
+- Conservar índices de consulta: Initiatives(OwnerId, State, UpdatedAt), Initiatives(State, Visibility, CreatedAt), ParticipationRequests(ApplicantId, CreatedAt), ParticipationRequests(InitiativeId, State), Memberships(InitiativeId, State, JoinedAt), MembershipEvents(InitiativeId, OccurredAt), Projects(CreatedAt); indexar FK de consultas frecuentes. Índices únicos filtrados de solicitudes/membresías, además del UNIQUE de origen del proyecto. En Sessions un proceso programado futuro elimina expiradas; toda petición comprueba la expiración y revocación incluso si aún existe la fila.
+
+## Plan de migración
+
+### Paso 1 — Inventario
+
+Todos los documentos tienen `_id` BSON ObjectId generado por MongoDB más el `id` público (UUID, salvo slug de categorías). Los modelos usan `versionKey: false`; no se migra `__v`. Los campos en negrita indican referencias o arreglos que se descomponen en la etapa relacional.
+
+| Colección | Campos escalares | Arreglos / referencias |
+| --- | --- | --- |
+| users | id, firstName, lastName, memberType, email, emailNormalized, passwordHash, career, bio, availability, portfolioUrl, active, createdAt, updatedAt | **interests[]**, **skills[]** (skillId referencia skills, level). |
+| sessions | id, tokenHash, expiresAt, revokedAt, createdAt | **userId → users**. |
+| categories | id (slug), name, nameNormalized, active | Ninguno. |
+| skills | id, name, nameNormalized, active | Ninguno. |
+| initiatives | id, title, type, summary, description, problem, beneficiaries, estimatedMembers, visibility, state, searchText, publicSearchText, titleNormalized, revision, createdAt, updatedAt | **ownerId → users**, **categoryId → categories**, **skillIds[] → skills**, **tags[]**. |
+| requests | id, message, role, availability, state, decisionComment, createdAt, updatedAt, decidedAt | **initiativeId → initiatives**, **applicantId → users**, **offeredSkillId → skills**. |
+| memberships | id, role, state, joinedAt, retiredAt | **initiativeId → initiatives**, **userId → users**, **sourceRequestId → requests** (opcional). |
+| membershipEvents | id, type, occurredAt | **initiativeId → initiatives**, **userId → users**, **membershipId → memberships**, **actorId → users**, **requestId → requests** (opcional). |
+| projects | id, name, description, objective, startDate, estimatedEndDate, state, repositoryUrl, createdAt, updatedAt | **sourceInitiativeId → initiatives**, **ownerId → users**, **technologies[]**. |
+
+Antes de migrar: tomar respaldo, identificar duplicados, verificar referencias, normalización/estados, fechas UTC y distinguir datos de producción frente a fixtures. Exportar en un entorno controlado, sin publicar hashes de sesión ni contraseña. Congelar escrituras durante la extracción consistente de las nueve colecciones o usar una instantánea equivalente.
+
+### Paso 2 — Correspondencia
+
+Aplicar exactamente la tabla [Del documento a la tabla](#del-documento-a-la-tabla) de la sección Diagrama. Los escalares se trasladan con los tipos definidos en Tablas, los arreglos se descomponen en filas con posición original y las referencias se resuelven mediante equivalencias del paso 4. No se materializan los campos calculados del DTO.
+
+### Paso 3 — Orden de creación de las tablas
+
+El siguiente orden sirve también para insertar datos y activar las FK sin dependencias inexistentes:
+
+| Orden | Tabla | Dependencias previas |
+| ---: | --- | --- |
+| 1 | Users | Ninguna |
+| 2 | Categories | Ninguna |
+| 3 | Skills | Ninguna |
+| 4 | Sessions | Users |
+| 5 | UserSkills | Users, Skills |
+| 6 | UserInterests | Users |
+| 7 | Initiatives | Users, Categories |
+| 8 | InitiativeSkills | Initiatives, Skills |
+| 9 | InitiativeTags | Initiatives |
+| 10 | ParticipationRequests | Initiatives, Users, Skills |
+| 11 | Memberships | Initiatives, Users, ParticipationRequests |
+| 12 | MembershipEvents | Memberships, Initiatives, Users, ParticipationRequests |
+| 13 | Projects | Initiatives, Users |
+| 14 | ProjectTechnologies | Projects |
+
+En la futura entrega se podrán generar migraciones EF Core en ese orden lógico, configurar FK y restricciones y aplicar la migración a una base vacía. No desactivar restricciones para ocultar datos inválidos.
+
+### Paso 4 — Identificadores
+
+Para cada colección, conservar una equivalencia temporal `(Collection, MongoObjectId, PublicId, SqlId)` con unicidad por colección y por identificador. SQL genera `Id INT IDENTITY` al insertar cada entidad y registra el valor mediante `OUTPUT INSERTED.Id`. Las referencias del Avance 2 usan el `id` público, no `_id`: se buscan por Collection + PublicId en la equivalencia; si se encuentra un ObjectId en una exportación legado, se resuelve por Collection + MongoObjectId. Una referencia que no se resuelva detiene la carga, sin inventar registros. Las filas de arreglos se identifican por su PK compuesta.
+
+| Colección | PublicId de ejemplo | SqlId de ejemplo |
+| --- | --- | ---: |
+| users | 11111111-1111-4111-8111-111111111111 | 1 |
+| skills | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4 | 4 |
+| initiatives | 10000000-0000-4000-8000-000000000008 | 8 |
+| projects | 50000000-0000-4000-8000-000000000001 | 1 |
+
+Los ObjectId reales se obtienen de la exportación MongoDB; no están en los fixtures JSON. En este ejemplo los Id numéricos son asignaciones ilustrativas, con huecos válidos; para reproducirlos se puede usar IDENTITY_INSERT de manera controlada en una base de prueba futura. La API devuelve `PublicId` como texto (por ejemplo UUID), nunca el Id numérico ni el ObjectId. Con ello no se rompen enlaces React, Postman ni datos ya referenciados.
+
+### Paso 5 — Carga de datos
+
+Datos sintéticos seleccionados de los fixtures reales del Avance 2: usuarios activos, tres iniciativas de distinta visibilidad, sus solicitudes e historial, y un proyecto convertido. Se incluyen todos los catálogos. Constituyen un subconjunto cerrado por referencias para el diseño; no son un volcado completo ni una base ejecutada. Las tablas están en el orden del paso 3. `NULL` representa ausencia. Los UUID y fechas se mantienen; las revisiones se inicializan en 0 para esta muestra. Los hashes no forman parte de los fixtures JSON: se generarán con scrypt para contraseñas de demostración al cargar en un futuro entorno aislado; `HASH_DEMO_n` es una indicación de ese valor obligatorio pendiente, no una credencial ni un hash válido. No hay sesiones activas en la muestra; se crearán al autenticar.
+
+#### 1. Users (4 filas)
+
+| Id | PublicId | FirstName | LastName | MemberType | Email | EmailNormalized | PasswordHash |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 11111111-1111-4111-8111-111111111111 | Ana | Rojas | student | ana.owner@example.test | ana.owner@example.test | HASH_DEMO_1 |
+| 2 | 22222222-2222-4222-8222-222222222222 | Luis | Mora | student | luis.applicant@example.test | luis.applicant@example.test | HASH_DEMO_2 |
+| 3 | 33333333-3333-4333-8333-333333333333 | Carla | Vega | professor | carla.outsider@example.test | carla.outsider@example.test | HASH_DEMO_3 |
+| 5 | 55555555-5555-4555-8555-555555555555 | Elena | Solís | administrative | elena.member@example.test | elena.member@example.test | HASH_DEMO_5 |
+
+| Id | Career | Bio | Availability | PortfolioUrl | Active | CreatedAt | UpdatedAt |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | Ingeniería del Software | Propietaria de iniciativas para pruebas compartidas. | high | NULL | 1 | 2026-10-10T14:00:00.000Z | 2026-10-10T14:00:00.000Z |
+| 2 | Diseño de Experiencias Digitales | Solicitante usado en escenarios de participación. | medium | https://example.test/luis | 1 | 2026-10-11T14:00:00.000Z | 2026-10-11T14:00:00.000Z |
+| 3 | NULL | NULL | low | NULL | 1 | 2026-10-12T14:00:00.000Z | 2026-10-12T14:00:00.000Z |
+| 5 | NULL | Miembro aceptado para escenarios de equipo. | high | NULL | 1 | 2026-10-14T14:00:00.000Z | 2026-10-14T14:00:00.000Z |
+
+Los bloques anteriores representan las mismas filas, enlazadas por Id.
+
+#### 2. Categories (8 filas)
+
+| Id | PublicId | Name | NameNormalized | Active |
+| --- | --- | --- | --- | --- |
+| 1 | technology | Tecnología | tecnologia | 1 |
+| 2 | education | Educación | educacion | 1 |
+| 3 | sustainability | Sostenibilidad | sostenibilidad | 1 |
+| 4 | social-impact | Impacto social | impacto social | 1 |
+| 5 | business | Negocios y emprendimiento | negocios y emprendimiento | 1 |
+| 6 | health | Salud y bienestar | salud y bienestar | 1 |
+| 7 | culture-creativity | Cultura y creatividad | cultura y creatividad | 1 |
+| 8 | other | Otro | otro | 1 |
+
+#### 3. Skills (10 filas)
+
+| Id | PublicId | Name | NameNormalized | Active |
+| --- | --- | --- | --- | --- |
+| 1 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1 | Desarrollo web | desarrollo web | 1 |
+| 2 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2 | Diseño | diseno | 1 |
+| 3 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3 | Investigación | investigacion | 1 |
+| 4 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4 | Comunicación | comunicacion | 1 |
+| 5 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5 | Logística | logistica | 1 |
+| 6 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6 | Facilitación | facilitacion | 1 |
+| 7 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7 | Datos | datos | 1 |
+| 8 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa8 | Sostenibilidad | sostenibilidad | 1 |
+| 9 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9 | Organización | organizacion | 1 |
+| 10 | aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa10 | Recursos humanos | recursos humanos | 1 |
+
+#### 4. Sessions (0 filas)
+
+| Id | PublicId | UserId | TokenHash | ExpiresAt | RevokedAt | CreatedAt |
+| --- | --- | --- | --- | --- | --- | --- |
+
+
+Sin filas: las sesiones se generan al autenticar.
+
+#### 5. UserSkills (7 filas)
+
+| UserId | SkillId | Level | Position |
+| --- | --- | --- | --- |
+| 1 | 2 | advanced | 1 |
+| 1 | 6 | intermediate | 2 |
+| 2 | 3 | intermediate | 1 |
+| 2 | 4 | advanced | 2 |
+| 3 | 3 | advanced | 1 |
+| 5 | 5 | advanced | 1 |
+| 5 | 9 | advanced | 2 |
+
+#### 6. UserInterests (7 filas)
+
+| UserId | Position | Value |
+| --- | --- | --- |
+| 1 | 1 | educación |
+| 1 | 2 | sostenibilidad |
+| 2 | 1 | accesibilidad |
+| 2 | 2 | comunidad |
+| 3 | 1 | investigación |
+| 5 | 1 | logística |
+| 5 | 2 | impacto social |
+
+#### 7. Initiatives (3 filas)
+
+| Id | PublicId | OwnerId | CategoryId | Title | Type | Summary | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | 10000000-0000-4000-8000-000000000004 | 1 | 2 | Mentorías tecnológicas | idea | Vincular estudiantes con mentores voluntarios de la institución. | Organizar sesiones breves para acompañar proyectos académicos y resolver bloqueos técnicos. |
+| 6 | 10000000-0000-4000-8000-000000000006 | 1 | 1 | Datos de calidad del aire | challenge | Visualizar lecturas ambientales en un tablero comprensible. | Crear gráficos claros con mediciones simuladas de diferentes zonas de la ciudad. |
+| 8 | 10000000-0000-4000-8000-000000000008 | 1 | 2 | Orientación laboral | need | Crear recursos y prácticas guiadas para entrevistas laborales. | Reunir guías y ofrecer espacios de práctica con voluntarios de recursos humanos. |
+
+| Id | Problem | Beneficiaries | EstimatedMembers | Visibility | State | SearchText | PublicSearchText |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | Faltan espacios de asesoría práctica para proyectos estudiantiles. | Estudiantes de la institución | 3 | institutional | published | mentorias tecnologicas vincular estudiantes con mentores voluntarios de la institucion. mentoria | mentorias tecnologicas vincular estudiantes con mentores voluntarios de la institucion. |
+| 6 | Los datos ambientales disponibles son difíciles de interpretar. | Habitantes, investigadores y docentes | 4 | private | published | datos de calidad del aire visualizar lecturas ambientales en un tablero comprensible. datos ambiente | datos de calidad del aire visualizar lecturas ambientales en un tablero comprensible. |
+| 8 | Las personas sin experiencia requieren apoyo para preparar sus postulaciones. | Personas en búsqueda de empleo | 2 | public | converted | orientacion laboral crear recursos y practicas guiadas para entrevistas laborales. empleo entrevistas | orientacion laboral crear recursos y practicas guiadas para entrevistas laborales. |
+
+| Id | TitleNormalized | Revision | CreatedAt | UpdatedAt |
+| --- | --- | --- | --- | --- |
+| 4 | mentorias tecnologicas | 0 | 2026-10-21T14:00:00.000Z | 2026-10-25T14:00:00.000Z |
+| 6 | datos de calidad del aire | 0 | 2026-10-22T14:00:00.000Z | 2026-10-22T14:00:00.000Z |
+| 8 | orientacion laboral | 0 | 2026-10-23T14:00:00.000Z | 2026-10-28T14:00:00.000Z |
+
+Los bloques anteriores representan las mismas filas, enlazadas por Id.
+
+#### 8. InitiativeSkills (6 filas)
+
+| InitiativeId | SkillId | Position |
+| --- | --- | --- |
+| 4 | 1 | 1 |
+| 4 | 6 | 2 |
+| 6 | 2 | 1 |
+| 6 | 7 | 2 |
+| 8 | 4 | 1 |
+| 8 | 10 | 2 |
+
+#### 9. InitiativeTags (5 filas)
+
+| InitiativeId | Position | Value |
+| --- | --- | --- |
+| 4 | 1 | mentoría |
+| 6 | 1 | datos |
+| 6 | 2 | ambiente |
+| 8 | 1 | empleo |
+| 8 | 2 | entrevistas |
+
+#### 10. ParticipationRequests (3 filas)
+
+| Id | PublicId | InitiativeId | ApplicantId | OfferedSkillId | Message | Role | Availability |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 3 | 20000000-0000-4000-8000-000000000003 | 4 | 2 | 4 | Quiero preparar materiales para las sesiones de mentoría tecnológica. | Preparación de materiales | medium |
+| 4 | 20000000-0000-4000-8000-000000000004 | 4 | 2 | 3 | Ahora puedo apoyar la investigación y seguimiento de cada mentoría. | Seguimiento de mentorías | medium |
+| 5 | 20000000-0000-4000-8000-000000000005 | 8 | 3 | 3 | Puedo revisar materiales y realizar entrevistas de práctica con participantes. | Mentoría de entrevistas | low |
+
+| Id | State | DecisionComment | CreatedAt | UpdatedAt | DecidedAt |
+| --- | --- | --- | --- | --- | --- |
+| 3 | rejected | El primer ciclo ya tenía cubierta esta función. | 2026-10-23T10:00:00.000Z | 2026-10-24T10:00:00.000Z | 2026-10-24T10:00:00.000Z |
+| 4 | pending | NULL | 2026-10-26T10:00:00.000Z | 2026-10-26T10:00:00.000Z | NULL |
+| 5 | accepted | NULL | 2026-10-25T11:00:00.000Z | 2026-10-26T11:00:00.000Z | 2026-10-26T11:00:00.000Z |
+
+Los bloques anteriores representan las mismas filas, enlazadas por Id.
+
+#### 11. Memberships (6 filas)
+
+| Id | PublicId | InitiativeId | UserId | Role | State | JoinedAt | RetiredAt | SourceRequestId |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | 30000000-0000-4000-8000-000000000004 | 4 | 1 | Propietaria | active | 2026-10-21T14:00:00.000Z | NULL | NULL |
+| 6 | 30000000-0000-4000-8000-000000000006 | 6 | 1 | Propietaria | active | 2026-10-22T14:00:00.000Z | NULL | NULL |
+| 8 | 30000000-0000-4000-8000-000000000008 | 8 | 1 | Propietaria | active | 2026-10-23T14:00:00.000Z | NULL | NULL |
+| 10 | 30000000-0000-4000-8000-000000000010 | 8 | 5 | Coordinación de talleres | active | 2026-10-24T10:00:00.000Z | NULL | NULL |
+| 11 | 30000000-0000-4000-8000-000000000011 | 8 | 3 | Mentoría de entrevistas | active | 2026-10-26T11:00:00.000Z | NULL | 5 |
+| 12 | 30000000-0000-4000-8000-000000000012 | 8 | 2 | Investigación laboral | retired | 2026-10-24T12:00:00.000Z | 2026-10-27T12:00:00.000Z | NULL |
+
+#### 12. MembershipEvents (7 filas)
+
+| Id | PublicId | InitiativeId | UserId | MembershipId | Type | OccurredAt | ActorId | RequestId |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | 40000000-0000-4000-8000-000000000004 | 4 | 1 | 4 | joined | 2026-10-21T14:00:00.000Z | 1 | NULL |
+| 6 | 40000000-0000-4000-8000-000000000006 | 6 | 1 | 6 | joined | 2026-10-22T14:00:00.000Z | 1 | NULL |
+| 8 | 40000000-0000-4000-8000-000000000008 | 8 | 1 | 8 | joined | 2026-10-23T14:00:00.000Z | 1 | NULL |
+| 10 | 40000000-0000-4000-8000-000000000010 | 8 | 5 | 10 | joined | 2026-10-24T10:00:00.000Z | 1 | NULL |
+| 11 | 40000000-0000-4000-8000-000000000011 | 8 | 3 | 11 | joined | 2026-10-26T11:00:00.000Z | 1 | 5 |
+| 12 | 40000000-0000-4000-8000-000000000012 | 8 | 2 | 12 | joined | 2026-10-24T12:00:00.000Z | 1 | NULL |
+| 13 | 40000000-0000-4000-8000-000000000013 | 8 | 2 | 12 | retired | 2026-10-27T12:00:00.000Z | 1 | NULL |
+
+#### 13. Projects (1 filas)
+
+| Id | PublicId | SourceInitiativeId | OwnerId | Name | Description | Objective | StartDate |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 50000000-0000-4000-8000-000000000001 | 8 | 1 | Programa de orientación laboral | Implementación de talleres y recursos para preparar postulaciones y entrevistas. | Acompañar a participantes durante la preparación de su búsqueda laboral. | 2026-11-01 |
+
+| Id | EstimatedEndDate | State | RepositoryUrl | CreatedAt | UpdatedAt |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 2027-02-28 | planning | NULL | 2026-10-25T16:00:00.000Z | 2026-10-25T16:00:00.000Z |
+
+Los bloques anteriores representan las mismas filas, enlazadas por Id.
+
+#### 14. ProjectTechnologies (2 filas)
+
+| ProjectId | Position | Value |
+| --- | --- | --- |
+| 1 | 1 | React |
+| 1 | 2 | Node.js |
