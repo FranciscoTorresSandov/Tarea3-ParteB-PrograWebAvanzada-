@@ -39,7 +39,7 @@ SELECT @@ROWCOUNT AS AffectedRows;
 ROLLBACK TRANSACTION;
 
 -- 5. DELETE con WHERE: quitar el interés "comunidad" de Luis (posición 2).
--- Esperado: una fila eliminada de UserInterests; quedan 6 intereses en total,
+-- Esperado: una fila    eliminada de UserInterests; quedan 6 intereses en total,
 -- Luis conserva "accesibilidad". No se borra al usuario ni su historial.
 -- No se usa DELETE sobre una iniciativa con historial, que sería inválido.
 BEGIN TRANSACTION;
