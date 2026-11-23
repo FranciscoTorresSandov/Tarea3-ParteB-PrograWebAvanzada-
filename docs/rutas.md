@@ -156,3 +156,94 @@ Si hay sesión válida, el mismo diseño aplica la autorización antes de contar
 
 El nombre de cada propiedad, el anidamiento y la estructura de paginación corresponden a `servidor/src/dto/initiative.dto.js` y `servidor/src/controllers/initiatives.controller.js`. Códigos adicionales: 400 por consulta inválida, 401 por sesión enviada pero vencida/inválida; una página sin datos devuelve 200 con `data: []`.
 
+## 2. GET /api/projects/{id}
+
+### Ruta y qué devuelve
+
+Ejemplo: `GET /api/projects/50000000-0000-4000-8000-000000000001`. Devuelve el detalle del proyecto Programa de orientación laboral, con iniciativa de origen, propietario, tecnologías, fechas, estado, repositorio y conteo de integrantes activos. Es público porque su iniciativa de origen es pública y se encuentra convertida. No devuelve una lista de miembros ni consulta GitHub: ese consumo externo es responsabilidad del cliente, cuando existe URL.
+
+### Tablas y recorrido
+
+| Tabla | Uso |
+| --- | --- |
+| Projects | Datos propios y UUID solicitado. |
+| Initiatives | Iniciativa de origen y regla de visibilidad. |
+| Users | Datos públicos del dueño del proyecto. |
+| ProjectTechnologies | Arreglo de tecnologías ordenadas. |
+| Memberships | Integrantes activos del equipo de origen. |
+
+```mermaid
+flowchart TD
+    A[GET proyecto por UUID] --> B[Projects e Initiatives]
+    B --> C{¿Puede ver la iniciativa?}
+    C -->|No| D[Error HTTP]
+    C -->|Sí| E[Leer propietario y tecnologías]
+    E --> F[Contar membresías activas]
+    F --> G[DTO proyecto 200]
+```
+
+### Consulta SQL
+
+El parámetro se valida como UUID antes de consultar. Caso sin sesión: se obtiene únicamente un proyecto con iniciativa pública y estado que permite detalle anónimo. Si no aparece una fila, el servicio distingue inexistencia, recurso privado/borrador/archivado (404) de institucional/restringido (401) con una comprobación interna de metadatos sin devolver datos protegidos. Para un actor autenticado, el servicio autoriza si es dueño o, fuera de borrador/archivada, es miembro activo o la visibilidad es public/institutional; restringida sin membresía devuelve 403 y privada ajena 404.
+
+```sql
+DECLARE @ProjectPublicId uniqueidentifier = '50000000-0000-4000-8000-000000000001';
+
+SELECT p.Id, p.PublicId, i.PublicId AS InitiativePublicId,
+       i.Title AS InitiativeTitle, u.PublicId AS OwnerPublicId,
+       u.FirstName, u.LastName, p.Name, p.Description, p.Objective,
+       p.StartDate, p.EstimatedEndDate, p.State, p.RepositoryUrl,
+       p.CreatedAt, p.UpdatedAt,
+       (SELECT COUNT(*) FROM dbo.Memberships AS m
+        WHERE m.InitiativeId = i.Id AND m.State = 'active') AS MemberCount
+INTO #AuthorizedProject
+FROM dbo.Projects AS p
+JOIN dbo.Initiatives AS i ON i.Id = p.SourceInitiativeId
+JOIN dbo.Users AS u ON u.Id = p.OwnerId
+WHERE p.PublicId = @ProjectPublicId
+  AND i.Visibility = 'public'
+  AND i.State NOT IN ('draft', 'archived');
+
+SELECT * FROM #AuthorizedProject;
+
+SELECT ap.Id AS ProjectId, t.Value
+FROM #AuthorizedProject AS ap
+JOIN dbo.ProjectTechnologies AS t ON t.ProjectId = ap.Id
+ORDER BY t.Position;
+
+DROP TABLE #AuthorizedProject;
+```
+
+El servicio combina la fila principal con las tecnologías, transforma las fechas DATE a `YYYY-MM-DD`, fechas UTC a ISO 8601, y mapea las llaves públicas a cadenas. El conteo usa el equipo de la iniciativa 8: Ana, Elena y Carla (3). Luis está retirado y no se cuenta. Las FK garantizan que la iniciativa y su propietario existen.
+
+### JSON esperado (200 OK)
+
+```json
+{
+  "data": {
+    "id": "50000000-0000-4000-8000-000000000001",
+    "sourceInitiative": {
+      "id": "10000000-0000-4000-8000-000000000008",
+      "title": "Orientación laboral"
+    },
+    "owner": {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "firstName": "Ana",
+      "lastName": "Rojas"
+    },
+    "name": "Programa de orientación laboral",
+    "description": "Implementación de talleres y recursos para preparar postulaciones y entrevistas.",
+    "objective": "Acompañar a participantes durante la preparación de su búsqueda laboral.",
+    "technologies": ["React", "Node.js"],
+    "startDate": "2026-11-01",
+    "estimatedEndDate": "2027-02-28",
+    "state": "planning",
+    "repositoryUrl": null,
+    "memberCount": 3,
+    "createdAt": "2026-10-25T16:00:00.000Z",
+    "updatedAt": "2026-10-25T16:00:00.000Z"
+  }
+}
+```
+
+La respuesta reproduce `servidor/src/dto/project.dto.js` y `servidor/src/controllers/projects.controller.js`. Un id inválido o query no permitido produce 400; inexistencia o acceso privado produce 404; se conservan 401/403 cuando corresponda. No se exponen identificadores SQL, hashes, correo ni campos internos.
