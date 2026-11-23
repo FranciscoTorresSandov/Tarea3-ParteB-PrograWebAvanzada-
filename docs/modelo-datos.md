@@ -601,3 +601,43 @@ Los bloques anteriores representan las mismas filas, enlazadas por Id.
 | --- | --- | --- |
 | 1 | 1 | React |
 | 1 | 2 | Node.js |
+
+#### Comprobación de los equipos
+
+| Iniciativa | Miembros activos | Miembros retirados | Espacios disponibles |
+| --- | --- | --- | --- |
+| Mentorías tecnológicas | Ana | Ninguno | 2 |
+| Datos de calidad del aire | Ana | Ninguno | 3 |
+| Orientación laboral | Ana, Elena, Carla | Luis | 0 |
+
+El proyecto 1 reutiliza el equipo de la iniciativa 8 (Ana, Elena y Carla); Luis conserva una membresía retirada y no cuenta en el equipo activo. La iniciativa estima 2 integrantes y tiene 3 activos, de modo que los espacios disponibles son 0 sin impedir nuevas solicitudes.
+
+### Paso 6 — Verificación
+
+1. Comparar los conteos de cada colección con la tabla principal y la suma de longitudes de cada arreglo con su tabla hija. La siguiente matriz expresa los valores esperados del subconjunto de prueba, no de la base completa del Avance 2.
+
+| Tabla | Filas esperadas | Origen |
+| --- | --- | --- |
+| Users | 4 | users |
+| Categories | 8 | categories |
+| Skills | 10 | skills |
+| Sessions | 0 | sessions (sin sesiones de demostración) |
+| UserSkills | 7 | Σ users.skills[] |
+| UserInterests | 7 | Σ users.interests[] |
+| Initiatives | 3 | initiatives |
+| InitiativeSkills | 6 | Σ initiatives.skillIds[] |
+| InitiativeTags | 5 | Σ initiatives.tags[] |
+| ParticipationRequests | 3 | requests |
+| Memberships | 6 | memberships |
+| MembershipEvents | 7 | membershipEvents |
+| Projects | 1 | projects |
+| ProjectTechnologies | 2 | Σ projects.technologies[] |
+
+2. Buscar FK sin padre con LEFT JOIN y filtro IS NULL (las FK opcionales nulas son válidas); cada búsqueda debe devolver cero filas. Comprobar la equivalencia PublicId→Id en ambas direcciones.
+3. Comparar los datos escalares y arreglos reconstruidos por Position con el JSON original; contrastar hashes existentes de forma privada, fechas, niveles, visibilidad y estados.
+4. Verificar índices únicos: no hay emails normalizados duplicados, dos solicitudes pendientes por pareja, dos membresías activas por pareja ni dos proyectos por iniciativa.
+5. Reproducir los conteos derivados: iniciativa 4 tiene 1 activo y 2 solicitudes (una rechazada y una pendiente); iniciativa 6 tiene 1 activo y ninguna solicitud; iniciativa 8 tiene 3 activos, 1 retirado y 1 solicitud aceptada. Debe existir para cada membresía un evento joined y para la retirada su evento retired.
+6. Revisar los resultados previstos de [consultas.sql](consultas.sql) y los dos JSON de [rutas.md](rutas.md), incluyendo privacidad y paginación. Confirmar que los DTO mantienen los UUID como texto, no identificadores internos.
+7. Si falta alguna fila o regla, cancelar la migración, corregir la extracción y volver a cargar en una base aislada; no publicar el nuevo backend hasta comprobar la paridad. Conservar el respaldo de MongoDB hasta finalizar las comprobaciones.
+
+No se ejecutan estas comprobaciones en SQL Server durante la Tarea 3: son el plan de verificación para la implementación posterior.
